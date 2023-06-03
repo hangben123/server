@@ -340,10 +340,10 @@ TraceManager::Trace::CaptureTimestamp(
       otel_common::SystemTimestamp otel_timestamp{
           (time_offset_ + std::chrono::nanoseconds{timestamp_ns})};
       if (trace_span_ == nullptr) {
-        InitSpan(otel_timestamp);
+        InitSpan(otel_timestamp, timestamp_ns);
       }
       trace_span_->AddEvent(
-          name, otel_timestamp);
+          name, otel_timestamp,  {{"ts", timestamp_ns}});
 #else
       LOG_ERROR << "Unsupported trace mode: "
                 << TraceManager::InferenceTraceModeString(setting_->mode_);
@@ -373,17 +373,26 @@ TraceManager::Trace::InitTracer(
       std::move(exporter_));
   provider_ = otel_trace_sdk::TracerProviderFactory::Create(
       std::move(processor_));
+  
 }
 
 void
-TraceManager::Trace::InitSpan(const otel_common::SystemTimestamp& timestamp_ns)
+TraceManager::Trace::InitSpan(const otel_common::SystemTimestamp& timestamp_ns, uint64_t& raw_timestamp_ns)
 {
   otel_trace_api::StartSpanOptions options;
   options.kind = otel_trace_api::SpanKind::kServer;  // server
   options.start_system_time = timestamp_ns;
+  options.start_steady_time = otel_common::SteadyTimestamp{std::chrono::nanoseconds{raw_timestamp_ns}};
   // [FIXME] think about names
   trace_span_ =
       provider_->GetTracer("triton-server")->StartSpan("InferRequest", options);
+  LOG_TRITONSERVER_ERROR(
+        TRITONSERVER_InferenceTraceSetOpenTelemetryTimeOffset(trace_, time_offset_.time_since_epoch().count()),
+        "setting OpenTelemetry time offset for TRITONSERVER_InferenceTrace");
+  LOG_TRITONSERVER_ERROR(
+        TRITONSERVER_InferenceTraceSetOpenTelemetryRootSpan(trace_, 
+        reinterpret_cast<void*>(trace_span_.get())),
+        "setting OpenTelemetry root span for TRITONSERVER_InferenceTrace");
 }
 
 void
@@ -492,7 +501,7 @@ TraceManager::TraceActivity(
     } else if (ts->setting_->mode_ == TRACE_MODE_OPENTELEMETRY) {
 #ifndef _WIN32
       if (ts->trace_span_ == nullptr) {
-        ts->InitSpan(ts->time_offset_ + std::chrono::nanoseconds{timestamp_ns});
+        ts->InitSpan(ts->time_offset_ + std::chrono::nanoseconds{timestamp_ns}, timestamp_ns);
       }
       ts->trace_span_->SetAttribute("triton.model_name", model_name);
       ts->trace_span_->SetAttribute("triton.model_version", model_version);
@@ -514,10 +523,10 @@ TraceManager::TraceActivity(
     otel_common::SystemTimestamp otel_timestamp{
         (ts->time_offset_ + std::chrono::nanoseconds{timestamp_ns})};
     if (ts->trace_span_ == nullptr) {
-      ts->InitSpan(otel_timestamp);
+      ts->InitSpan(otel_timestamp, timestamp_ns);
     }
     ts->trace_span_->AddEvent(
-        TRITONSERVER_InferenceTraceActivityString(activity), otel_timestamp);
+        TRITONSERVER_InferenceTraceActivityString(activity), otel_timestamp, {{"ts", timestamp_ns}});
 #else
     LOG_ERROR << "Unsupported trace mode: "
               << TraceManager::InferenceTraceModeString(ts->setting_->mode_);
@@ -834,6 +843,10 @@ TraceManager::TraceSetting::SampleTrace()
     if (mode_ == TRACE_MODE_OPENTELEMETRY) {
 #ifndef _WIN32
       lts->InitTracer(config_map_);
+      LOG_TRITONSERVER_ERROR(
+        TRITONSERVER_InferenceTraceSetOpenTelemetryTracer(trace, 
+        reinterpret_cast<void*>(lts->provider_->GetTracer("triton-server").get())),
+        "setting OpenTelemetry tracer for TRITONSERVER_InferenceTrace");
 #else
       LOG_ERROR << "Unsupported trace mode: "
                 << TraceManager::InferenceTraceModeString(mode_);
